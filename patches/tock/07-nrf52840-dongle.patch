@@ -1,0 +1,63 @@
+diff --git a/arch/cortex-m/src/scb.rs b/arch/cortex-m/src/scb.rs
+index 8107f165..bf96e47c 100644
+--- a/arch/cortex-m/src/scb.rs
++++ b/arch/cortex-m/src/scb.rs
+@@ -54,3 +54,8 @@ pub unsafe fn reset() {
+     let reset = (0x5FA << 16) | (aircr & (0x7 << 8)) | (1 << 2);
+     SCB.aircr.set(reset);
+ }
++
++/// Software reset using the ARM System Control Block
++pub unsafe fn set_vector_table_offset(offset: u32) {
++    SCB.vtor.set(offset);
++}
+diff --git a/boards/nordic/nrf52840_dongle/src/main.rs b/boards/nordic/nrf52840_dongle/src/main.rs
+index 9a8dccfd..9008fb95 100644
+--- a/boards/nordic/nrf52840_dongle/src/main.rs
++++ b/boards/nordic/nrf52840_dongle/src/main.rs
+@@ -7,6 +7,7 @@
+ #![no_main]
+ #![deny(missing_docs)]
+
++use cortexm4::scb;
+ use kernel::component::Component;
+ #[allow(unused_imports)]
+ use kernel::{debug, debug_gpio, debug_verbose, static_init};
+@@ -39,6 +40,8 @@ pub mod io;
+ // How should the kernel respond when a process faults.
+ const FAULT_RESPONSE: kernel::procs::FaultResponse = kernel::procs::FaultResponse::Panic;
+
++const VECTOR_TABLE_OFFSET: Option<&'static str> = option_env!("VECTOR_TABLE_OFFSET");
++
+ // Number of concurrent processes this platform supports.
+ const NUM_PROCS: usize = 8;
+
+@@ -63,6 +66,16 @@ pub unsafe fn reset_handler() {
+     // Loads relocations and clears BSS
+     nrf52840::init();
+
++    if VECTOR_TABLE_OFFSET.is_some() {
++        match VECTOR_TABLE_OFFSET.unwrap().parse::<u32>() {
++            Ok(n) => {
++                // relocate vector table, interrupt vector table is at 0x1000
++                scb::set_vector_table_offset(n);
++            },
++            Err(_e) => {},
++        }
++    }
++
+     let board_kernel = static_init!(kernel::Kernel, kernel::Kernel::new(&PROCESSES));
+     // GPIOs
+     let gpio = components::gpio::GpioComponent::new(board_kernel).finalize(
+diff --git a/boards/nordic/nrf52840_dongle/Makefile b/boards/nordic/nrf52840_dongle/Makefile
+index 61dc5759..3c4b0ad9 100644
+--- a/boards/nordic/nrf52840_dongle/Makefile
++++ b/boards/nordic/nrf52840_dongle/Makefile
+@@ -25,5 +25,5 @@ flash: target/$(TARGET)/release/$(PLATFORM).bin
+ 
+ # Upload the kernel over serial/bootloader
+ .PHONY: program
+-program: target/$(TARGET)/release/$(PLATFORM).hex
+-	$(error Cannot program nRF52 Dongle over USB. Use \`make flash\` and JTAG)
++program: target/$(TARGET)/release/$(PLATFORM).bin
++	$(warning Cannot program nRF52 Dongle over USB. Use \`make flash\` and JTAG)

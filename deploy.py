@@ -121,6 +121,7 @@ class OpenSKInstaller:
     self.args = args
     # Where all the TAB files should go
     self.tab_folder = os.path.join("target", "tab")
+    os.makedirs(self.tab_folder, exist_ok=True)
     # This is the filename that elf2tab command expects in order
     # to create a working TAB file.
     self.target_elf_filename = os.path.join(self.tab_folder, "cortex-m4.elf")
@@ -170,6 +171,15 @@ class OpenSKInstaller:
           ["rustup", "target", "add", "thumbv7em-none-eabi"])
     info("Rust toolchain up-to-date")
 
+  def build_tockos(self):
+    self.checked_command_output(
+        ["make", "-C", SUPPORTED_BOARDS[self.args.board], "program"])
+    src_file = os.path.join(
+        SUPPORTED_BOARDS[self.args.board],
+        "target/thumbv7em-none-eabi/release/" + self.args.board + ".bin")
+    shutil.copyfile(src_file,
+                    os.path.join(self.tab_folder, self.args.board + ".bin"))
+
   def build_and_install_tockos(self):
     self.checked_command_output(
         ["make", "-C", SUPPORTED_BOARDS[self.args.board], "flash"])
@@ -185,7 +195,7 @@ class OpenSKInstaller:
         os.path.join("target/thumbv7em-none-eabi/release/examples",
                      self.args.application))
 
-  def build_and_install_opensk(self):
+  def build_opensk(self):
     assert self.args.application
     info("Building OpenSK application")
     self.checked_command_output([
@@ -195,6 +205,9 @@ class OpenSKInstaller:
         "--target=thumbv7em-none-eabi",
         "--features={}".format(",".join(self.args.features)),
     ])
+
+  def build_and_install_opensk(self):
+    self.build_opensk()
     self.install_elf_file(
         os.path.join("target/thumbv7em-none-eabi/release",
                      self.args.application))
@@ -208,7 +221,7 @@ class OpenSKInstaller:
       error(("Something went wrong while trying to generate ECC "
              "key and/or certificate for OpenSK"))
 
-  def install_elf_file(self, elf_path):
+  def build_elf_file(self, elf_path):
     assert self.args.application
     package_parameter = "-n"
     elf2tab_ver = self.checked_command_output(["elf2tab", "--version"]).split(
@@ -218,7 +231,6 @@ class OpenSKInstaller:
     # running the HEAD from github to be stuck
     if "0.5.0-dev" in elf2tab_ver:
       package_parameter = "--package-name"
-    os.makedirs(self.tab_folder, exist_ok=True)
     tab_filename = os.path.join(self.tab_folder,
                                 "{}.tab".format(self.args.application))
     shutil.copyfile(elf_path, self.target_elf_filename)
@@ -228,7 +240,12 @@ class OpenSKInstaller:
         "--app-heap={}".format(APP_HEAP_SIZE), "--kernel-heap=1024",
         "--protected-region-size=64"
     ])
+
+  def install_elf_file(self, elf_path):
+    self.build_elf_file(elf_path)
     self.install_padding()
+    tab_filename = os.path.join(self.tab_folder,
+                                "{}.tab".format(self.args.application))
     info("Installing Tock application {}".format(self.args.application))
     args = copy.copy(self.tockloader_default_args)
     setattr(args, "app_address", 0x40000)
@@ -244,13 +261,20 @@ class OpenSKInstaller:
       fatal("Couldn't install Tock application {}: {}".format(
           self.args.application, str(e)))
 
-  def install_padding(self):
+  def build_padding(self):
     fake_header = tbfh.TBFHeader("")
     fake_header.version = 2
     fake_header.fields["header_size"] = 0x10
     fake_header.fields["total_size"] = 0x10000
     fake_header.fields["flags"] = 0
     padding = fake_header.get_binary()
+    padding_filename = os.path.join(self.tab_folder, "padding.bin")
+    with open(padding_filename, "wb") as f:
+      f.write(padding)
+    return padding
+
+  def install_padding(self):
+    padding = self.build_padding()
     info("Flashing padding application")
     args = copy.copy(self.tockloader_default_args)
     setattr(args, "address", 0x30000)
@@ -293,25 +317,37 @@ class OpenSKInstaller:
 
     if self.args.action == "os":
       info("Installing Tock on board {}".format(self.args.board))
-      self.build_and_install_tockos()
+      if self.args.build_only:
+        self.build_tockos()
+      else:
+        self.build_and_install_tockos()
       return 0
 
     if self.args.action == "app":
       if self.args.application is None:
         fatal("Unspecified application")
       if self.args.clear_apps:
-        self.clear_apps()
+        if not self.args.build_only:
+          self.clear_apps()
       if self.args.application == "ctap2":
         self.generate_crypto_materials(self.args.regenerate_keys)
-        self.build_and_install_opensk()
+        if self.args.build_only:
+          self.build_opensk()
+          self.build_elf_file(
+              os.path.join("target/thumbv7em-none-eabi/release",
+                           self.args.application))
+          self.build_padding()
+        else:
+          self.build_and_install_opensk()
       else:
         self.build_and_install_example()
-      if self.verify_flashed_app(self.args.application):
-        info("You're all set!")
-        return 0
-      error(("It seems that something went wrong. "
-             "App/example not found on your board."))
-      return 1
+      if not self.args.build_only:
+        if self.verify_flashed_app(self.args.application):
+          info("You're all set!")
+          return 0
+        error(("It seems that something went wrong. "
+               "App/example not found on your board."))
+        return 1
     return 0
 
 
@@ -319,9 +355,9 @@ def main(args):
   # Make sure the current working directory is the right one before running
   os.chdir(os.path.realpath(os.path.dirname(__file__)))
   # Check for pre-requisite executable files.
-  if not shutil.which("JLinkExe"):
-    fatal(("Couldn't find JLinkExe binary. Make sure Segger JLink tools "
-           "are installed and correctly set up."))
+  # if not shutil.which("JLinkExe"):
+  #   fatal(("Couldn't find JLinkExe binary. Make sure Segger JLink tools "
+  #          "are installed and correctly set up."))
 
   OpenSKInstaller(args).run()
 
@@ -356,11 +392,25 @@ if __name__ == "__main__":
       choices=get_supported_boards(),
       help="Indicates which board Tock OS will be compiled for.",
       required=True)
+  os_commands.add_argument(
+      "--build-only",
+      action="store_true",
+      default=False,
+      dest="build_only",
+      help=("Build only target bin files, do not flash the board"),
+  )
 
   app_commands = commands.add_parser(
       "app",
       parents=[shared_parser],
       help="compiles and installs an application.")
+  app_commands.add_argument(
+      "--build-only",
+      action="store_true",
+      default=False,
+      dest="build_only",
+      help=("Build only target bin files, do not flash the board"),
+  )
   app_commands.add_argument(
       "--panic-console",
       action="append_const",
